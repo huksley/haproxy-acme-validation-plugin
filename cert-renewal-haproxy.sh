@@ -12,37 +12,43 @@
 ## configuration ##
 ###################
 
-EMAIL="your_le_account@email.com"
-
-LE_CLIENT="/path/to/letsencrypt-auto"
-
-HAPROXY_RELOAD_CMD="service haproxy reload"
-
-WEBROOT="/var/lib/haproxy"
-
-# Enable to redirect output to logfile (for silent cron jobs)
-# LOGFILE="/var/log/certrenewal.log"
+EMAIL=${EMAIL:-set_me_in_env@gmail.com}
+FORCE_RENEW=${FORCE_RENEW:-0}
+DAYS=${DAYS:-30}
+LE_CLIENT=${LE_CLIENT:-certbot}
+HAPROXY_RELOAD_CMD=${HAPROXY_RELOAD_CMD:-service haproxy reload}
+WEBROOT=${WEBROOT:-/var/lib/haproxy}
+LOGFILE="/var/log/certrenewal.log"
+# Set to 1 to redirect output to logfile (for silent cron jobs)
+LOGTOFILE=${LOGTOFILE:-0}
 
 ######################
 ## utility function ##
 ######################
 
 function issueCert {
-  $LE_CLIENT certonly --text --webroot --webroot-path ${WEBROOT} --renew-by-default --agree-tos --email ${EMAIL} $1 &>/dev/null
+  # if only 1 dot i.e. domain.com -> add www.domain.com to signing
+  DOMAIN=$1
+  DOTS=`echo "$DOMAIN" | awk -F. '{ print NF - 1 }'`
+  ADD_DOMAINS=""
+  if [ "$DOTS" = "1" ]; then
+    ADD_DOMAINS="-d www.$DOMAIN"
+    logger_error "Also issuing for www.$DOMAIN"
+  fi
+  $LE_CLIENT certonly --text --webroot --webroot-path ${WEBROOT} --renew-by-default --agree-tos --email ${EMAIL} -d $DOMAIN $ADD_DOMAINS
   return $?
 }
 
 function logger_error {
-  if [ -n "${LOGFILE}" ]
-  then
+  if [ $LOGTOFILE -gt 0 ]; then
     echo "[error] [$(date +'%d.%m.%y - %H:%M')] ${1}" >> ${LOGFILE}
+  else
+    (>&2 echo "[error] ${1}")
   fi
-  >&2 echo "[error] ${1}"
 }
 
 function logger_info {
-  if [ -n "${LOGFILE}" ]
-  then
+  if [ $LOGTOFILE -gt 0 ]; then
     echo "[info] [$(date +'%d.%m.%y - %H:%M')] ${1}" >> ${LOGFILE}
   else
     echo "[info] ${1}"
@@ -64,11 +70,23 @@ fi
 # for those that expire in under 4 weeks
 renewed_certs=()
 exitcode=0
+echo $DAYS
+SECS=`expr $DAYS \* 86400`
 while IFS= read -r -d '' cert; do
-  if ! openssl x509 -noout -checkend $((4*7*86400)) -in "${cert}"; then
+  logger_info "${cert}"
+
+  need=0
+  if ! openssl x509 -noout -checkend $SECS -in "${cert}"; then
+    need=1
+  fi
+  if [ "$FORCE_RENEW" = "1" ]; then
+    need=1
+  fi
+
+  if [ "$need" = "1" ]; then
     subject="$(openssl x509 -noout -subject -in "${cert}" | grep -o -E 'CN=[^ ,]+' | tr -d 'CN=')"
     subjectaltnames="$(openssl x509 -noout -text -in "${cert}" | sed -n '/X509v3 Subject Alternative Name/{n;p}' | sed 's/\s//g' | tr -d 'DNS:' | sed 's/,/ /g')"
-    domains="-d ${subject}"
+    domains="${subject}"
     for name in ${subjectaltnames}; do
       if [ "${name}" != "${subject}" ]; then
         domains="${domains} -d ${name}"
@@ -88,6 +106,33 @@ while IFS= read -r -d '' cert; do
   fi
 done < <(find /etc/letsencrypt/live -name cert.pem -print0)
 
+# reissue for domains declared but no existing in letsencrypt dir
+for N in `cat /etc/haproxy/haproxy.cfg | grep "ssl crt" | grep -v "crt-list" | sed -re "s/.*ssl crt//g"`; do
+    if [ -f $N ]; then
+	logger_info "skipping existing declared cert $N"
+    else
+	certdir=`dirname $N`
+	domain=`basename ${certdir}`
+	logger_info "issuing for $domain"
+	issueCert ${domain}
+    fi
+done
+
+# reissue for domains declared but no existing in letsencrypt dir (crt-list)
+for F in `cat /etc/haproxy/haproxy.cfg | grep "ssl crt-list" | sed -re "s/.*ssl crt-list//g"`; do
+    logger_info "reading $F for certificate list"
+    for N in `cat $F`; do
+	if [ -f $N ]; then
+	    logger_info "skipping existing declared cert $N"
+	else
+	    certdir=`dirname $N`
+	    domain=`basename ${certdir}`
+	    logger_info "issuing for $domain"
+	    issueCert ${domain}
+	fi
+    done
+done
+
 # create haproxy.pem file(s)
 for domain in ${renewed_certs[@]}; do
   cat ${le_cert_root}/${domain}/privkey.pem ${le_cert_root}/${domain}/fullchain.pem | tee ${le_cert_root}/${domain}/haproxy.pem >/dev/null
@@ -96,6 +141,15 @@ for domain in ${renewed_certs[@]}; do
     exit 1
   fi
 done
+
+# create haproxy for previously issued domains
+while IFS= read -r -d '' cert; do
+    certdir=`dirname $cert`
+    if [ ! -f ${certdir}/haproxy.pem ]; then
+	logger_info "Restoring haproxy pem for $cert"
+	cat ${certdir}/privkey.pem ${certdir}/fullchain.pem  | tee ${certdir}/haproxy.pem >/dev/null
+    fi
+done < <(find /etc/letsencrypt/live -name cert.pem -print0)
 
 # soft-restart haproxy
 if [ "${#renewed_certs[@]}" -gt 0 ]; then
