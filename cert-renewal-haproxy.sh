@@ -70,10 +70,11 @@ fi
 # for those that expire in under 4 weeks
 renewed_certs=()
 exitcode=0
-echo $DAYS
 SECS=`expr $DAYS \* 86400`
-while IFS= read -r -d '' cert; do
-  logger_info "${cert}"
+while read domain; do
+  latest_folder=` ls -1 ${le_cert_root} | grep ^${domain} | sort | tail -n1 `
+  cert=${le_cert_root}/${latest_folder}/cert.pem
+  logger_info "${cert} name ${certname} latest ${latest_folder}"
 
   need=0
   if ! openssl x509 -noout -checkend $SECS -in "${cert}"; then
@@ -104,7 +105,7 @@ while IFS= read -r -d '' cert; do
   else
     logger_info "none of the certificates requires renewal"
   fi
-done < <(find /etc/letsencrypt/live -name cert.pem -print0)
+done < <(ls -1 ${le_cert_root} | grep -vE -- "-0[0-9]+")
 
 # reissue for domains declared but no existing in letsencrypt dir
 for N in `cat /etc/haproxy/haproxy.cfg | grep "ssl crt" | grep -v "crt-list" | sed -re "s/.*ssl crt//g"`; do
@@ -133,23 +134,20 @@ for F in `cat /etc/haproxy/haproxy.cfg | grep "ssl crt-list" | sed -re "s/.*ssl 
     done
 done
 
-# create haproxy.pem file(s)
-for domain in ${renewed_certs[@]}; do
-  cat ${le_cert_root}/${domain}/privkey.pem ${le_cert_root}/${domain}/fullchain.pem | tee ${le_cert_root}/${domain}/haproxy.pem >/dev/null
-  if [ $? -ne 0 ]; then
-    logger_error "failed to create haproxy.pem file!"
-    exit 1
+# recreate crtlist.txt
+echo -n >/etc/haproxy/crtlist.new
+while read domain; do
+  latest_folder=` ls -1 ${le_cert_root} | grep ^${domain} | sort | tail -n1 `
+  cert=${le_cert_root}/${latest_folder}/cert.pem
+  logger_info "${cert} name ${certname} latest ${latest_folder}"
+  if [ -f ${cert} ]; then
+    cat ${le_cert_root}/${latest_folder}/privkey.pem ${le_cert_root}/${latest_folder}/fullchain.pem > ${le_cert_root}/${latest_folder}/haproxy.pem
+  else
+    rm -Rf ${le_cert_root}/${latest_folder}/haproxy.pem
   fi
-done
-
-# create haproxy for previously issued domains
-while IFS= read -r -d '' cert; do
-    certdir=`dirname $cert`
-    if [ ! -f ${certdir}/haproxy.pem ]; then
-	logger_info "Restoring haproxy pem for $cert"
-	cat ${certdir}/privkey.pem ${certdir}/fullchain.pem  | tee ${certdir}/haproxy.pem >/dev/null
-    fi
-done < <(find /etc/letsencrypt/live -name cert.pem -print0)
+  echo ${le_cert_root}/${latest_folder}/haproxy.pem>>/etc/haproxy/crtlist.new
+done < <(ls -1 ${le_cert_root} | grep -vE -- "-0[0-9]+")
+mv /etc/haproxy/crtlist.new /etc/haproxy/crtlist.txt
 
 # soft-restart haproxy
 if [ "${#renewed_certs[@]}" -gt 0 ]; then
