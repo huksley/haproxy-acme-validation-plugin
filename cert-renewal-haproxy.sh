@@ -116,6 +116,14 @@ for N in `cat /etc/haproxy/haproxy.cfg | grep "ssl crt" | grep -v "crt-list" | s
 	domain=`basename ${certdir}`
 	logger_info "issuing for $domain"
 	issueCert ${domain}
+	if [ $? -ne 0 ]
+	then
+    	    logger_error "failed to renew certificate! check /var/log/letsencrypt/letsencrypt.log!"
+    	    exitcode=1
+	else
+    	    renewed_certs+=("$subject")
+    	    logger_info "renewed certificate for ${subject}"
+	fi
     fi
 done
 
@@ -130,6 +138,14 @@ for F in `cat /etc/haproxy/haproxy.cfg | grep "ssl crt-list" | sed -re "s/.*ssl 
 	    domain=`basename ${certdir}`
 	    logger_info "issuing for $domain"
 	    issueCert ${domain}
+	    if [ $? -ne 0 ]
+	    then
+    		logger_error "failed to renew certificate! check /var/log/letsencrypt/letsencrypt.log!"
+    		exitcode=1
+	    else
+    		renewed_certs+=("$subject")
+    		logger_info "renewed certificate for ${subject}"
+	    fi
 	fi
     done
 done
@@ -151,6 +167,7 @@ mv /etc/haproxy/crtlist.new /etc/haproxy/crtlist.txt
 
 # soft-restart haproxy
 if [ "${#renewed_certs[@]}" -gt 0 ]; then
+  logger_info "reloading haproxy"
   $HAPROXY_RELOAD_CMD
   if [ $? -ne 0 ]; then
     logger_error "failed to reload haproxy!"
